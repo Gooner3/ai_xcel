@@ -15,6 +15,8 @@ import pandas as pd
 import requests
 from tabulate import tabulate
 
+from sheet_utils import load_dataframe, merge_dataframes, lookup_dataframe
+
 
 # =========================
 #   JSON / InfoTree utils
@@ -71,6 +73,7 @@ class SpreadsheetAgent:
         self.history_dir = Path(".history")
         self.prompts_dir.mkdir(exist_ok=True)
         self.history_dir.mkdir(exist_ok=True)
+        self.api_log_path = Path("api_prompts.log")
 
         self.llama_endpoint = llama_endpoint
         self.model = model
@@ -78,6 +81,7 @@ class SpreadsheetAgent:
 
         self.sheet_path = sheet_path
         self.df: Optional[pd.DataFrame] = None
+        self.extra_dfs: Dict[str, pd.DataFrame] = {}
         self.changes_history: List[Dict[str, Any]] = []   # in-memory stack
         self._last_generated_blocks: List[str] = []
         self._last_request: str = ""
@@ -93,18 +97,13 @@ class SpreadsheetAgent:
 
     def load_data(self, file_path: str) -> bool:
         try:
-            if file_path.lower().endswith(".csv"):
-                self.df = pd.read_csv(file_path)
-            elif file_path.lower().endswith((".xlsx", ".xls")):
-                self.df = pd.read_excel(file_path)
-            else:
-                print(f"[!] Unsupported file format: {file_path}")
-                return False
+            self.df = load_dataframe(file_path)
             print(f"✓ Loaded {file_path} ({len(self.df)} rows × {len(self.df.columns)} cols)")
             return True
         except Exception as e:
             print(f"[✗] Load error: {e}")
             return False
+
 
     def save_data(self, file_path: Optional[str] = None) -> bool:
         if self.df is None:
@@ -139,6 +138,8 @@ class SpreadsheetAgent:
                 "USER:\n{user_request}\n\n"
                 "Write pandas code to modify df. No prose. No backticks. No prints."
             ),
+            # Optional user instructions prepended to every request
+            "instructions.txt": "",
         }
         for name, content in defaults.items():
             p = self.prompts_dir / name
@@ -151,6 +152,14 @@ class SpreadsheetAgent:
             p.write_text("", encoding="utf-8")
         return p.read_text(encoding="utf-8").strip()
 
+    def _log_api_prompt(self, payload: Dict[str, Any]) -> None:
+        try:
+            entry = {"timestamp": datetime.now().isoformat(), "payload": payload}
+            with self.api_log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, cls=NumpyEncoder) + "\n")
+        except Exception as e:
+            print(f"[!] Log error: {e}")
+
     def query_llama(self, user_request: str) -> str:
         """Send info tree + request to llama.cpp and return raw text."""
         system_prompt = self._read_prompt("system.txt")
@@ -161,6 +170,11 @@ class SpreadsheetAgent:
 
         prompt = analyze_t.format(info_tree=info_json, user_request=user_request)
 
+        # Prepend any user-specified instructions from .prompts/instructions.txt
+        extra_instructions = self._read_prompt("instructions.txt")
+        if extra_instructions:
+            prompt = f"{extra_instructions}\n\n{prompt}"
+
         payload = {
             "model": self.model,
             "messages": [
@@ -170,6 +184,8 @@ class SpreadsheetAgent:
             "temperature": 0.0,
             "max_tokens": 1500,
         }
+
+        self._log_api_prompt(payload)
 
         try:
             r = requests.post(self.llama_endpoint, json=payload, timeout=360)
@@ -294,12 +310,14 @@ class SpreadsheetAgent:
     def _exec_on_copy(self, code: str, df: pd.DataFrame) -> Tuple[bool, Optional[pd.DataFrame], Optional[str]]:
         """Execute code against a COPY for preview. Returns (ok, new_df, error)."""
         try:
-            local_vars = {"df": df.copy(), "pd": pd, "np": np}
-            exec(code, {"__builtins__": {}}, local_vars)
-            new_df = local_vars.get("df", None)
+            local_vars = {'df': df.copy(), 'pd': pd, 'np': np}
+            for name, other in self.extra_dfs.items():
+                local_vars[name] = other.copy()
+            exec(code, {'__builtins__': {}}, local_vars)
+            new_df = local_vars.get('df', None)
             if new_df is None or not isinstance(new_df, pd.DataFrame):
                 # If they mutated in-place and didn't reassign, use the mutated df
-                new_df = local_vars.get("df", df)
+                new_df = local_vars.get('df', df)
             return True, new_df, None
         except Exception as e:
             return False, None, str(e)
@@ -423,7 +441,10 @@ class SpreadsheetAgent:
         print("  ask <instruction>   # AI generates code; previews condensed diff by default")
         print("  apply               # apply last generated code block(s)")
         print("  undo                # undo last applied change")
-        print("  show [n]            # show first n rows (default 8)")
+        print("  load <name> <path>  # load another sheet as DataFrame")
+        print("  merge <name> <main_col> [other_col]  # merge a loaded sheet into main")
+        print("  lookup <name> <column> <value>  # search a loaded sheet")
+        print("  show [name|n]       # show main (default) or loaded sheet, or first n rows")
         print("  info                # detailed info tree (JSON)")
         print("  save [path]         # save to path (or overwrite original)")
         print("  reload              # reload original file from disk")
@@ -442,8 +463,20 @@ class SpreadsheetAgent:
 
                 if cmd.startswith("show"):
                     parts = cmd.split()
-                    n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 8
-                    self._default_preview(rows=n)
+                    if len(parts) == 1:
+                        self._default_preview(rows=8)
+                    elif len(parts) == 2 and parts[1].isdigit():
+                        n = int(parts[1])
+                        self._default_preview(rows=n)
+                    else:
+                        name = parts[1]
+                        df2 = self.extra_dfs.get(name)
+                        if df2 is None:
+                            print(f"[!] No sheet named '{name}'.")
+                        else:
+                            print(f"\n=== {name} preview (first 8 rows) ===")
+                            print(tabulate(df2.head(8), headers='keys', tablefmt='github', showindex=False))
+                            print(f"\nShape: {df2.shape}, Columns: {len(df2.columns)}")
                     continue
 
                 if cmd == "info":
@@ -467,6 +500,60 @@ class SpreadsheetAgent:
                         print("[!] No original path available to reload.")
                     continue
 
+                if cmd.startswith('load '):
+                    parts = cmd.split(maxsplit=2)
+                    if len(parts) != 3:
+                        print('Usage: load <name> <path>')
+                        continue
+                    name, path_str = parts[1], parts[2]
+                    try:
+                        df2 = load_dataframe(path_str)
+                        self.extra_dfs[name] = df2
+                        print(f"✓ Loaded '{name}' ({len(df2)} rows × {len(df2.columns)} cols)")
+                    except Exception as e:
+                        print(f"[✗] Load error: {e}")
+                    continue
+
+                if cmd.startswith('merge '):
+                    parts = cmd.split()
+                    if len(parts) not in (3, 4):
+                        print('Usage: merge <name> <main_col> [other_col]')
+                        continue
+                    name = parts[1]
+                    other = self.extra_dfs.get(name)
+                    if other is None:
+                        print(f"[!] No sheet named '{name}'.")
+                        continue
+                    left_key = parts[2]
+                    right_key = parts[3] if len(parts) == 4 else left_key
+                    if left_key not in self.df.columns or right_key not in other.columns:
+                        print('[!] Column missing in one of the sheets.')
+                        continue
+                    self.df = merge_dataframes(self.df, other, left_key, right_key)
+                    print(f"✓ Merged '{name}' into main sheet on '{left_key}' ← '{right_key}'")
+                    self._default_preview(rows=8)
+                    continue
+
+                if cmd.startswith('lookup '):
+                    parts = cmd.split()
+                    if len(parts) < 4:
+                        print('Usage: lookup <name> <column> <value>')
+                        continue
+                    name, column = parts[1], parts[2]
+                    value = ' '.join(parts[3:])
+                    other = self.extra_dfs.get(name)
+                    if other is None:
+                        print(f"[!] No sheet named '{name}'.")
+                        continue
+                    if column not in other.columns:
+                        print(f"[!] Column '{column}' not found in '{name}'.")
+                        continue
+                    matches = lookup_dataframe(other, column, value)
+                    if matches.empty:
+                        print('No matches found.')
+                    else:
+                        print(tabulate(matches, headers='keys', tablefmt='github', showindex=False))
+                    continue
                 if cmd == "undo":
                     self.undo()
                     continue
@@ -532,7 +619,10 @@ class SpreadsheetAgent:
                     print("  ask <instruction>   # AI generates code; previews condensed diff by default")
                     print("  apply               # apply last generated code block(s)")
                     print("  undo                # undo last applied change")
-                    print("  show [n]            # show first n rows (default 8)")
+                    print("  load <name> <path>  # load another sheet as DataFrame")
+                    print("  merge <name> <main_col> [other_col]  # merge a loaded sheet into main")
+                    print("  lookup <name> <column> <value>  # search a loaded sheet")
+                    print("  show [name|n]       # show main (default) or loaded sheet, or first n rows")
                     print("  info                # detailed info tree (JSON)")
                     print("  save [path]         # save to path (or overwrite original)")
                     print("  reload              # reload original file from disk")
