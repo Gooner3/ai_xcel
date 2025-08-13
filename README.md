@@ -18,3 +18,5 @@ Run `python main_chatgpt.py path/to/main.csv` to load the primary sheet. At the 
 - `quit` – exit the program.
 
 Secondary sheets are kept in memory only so you can reference or merge their data while keeping the primary sheet under your control.
+
+Every prompt sent to the model is appended to `api_prompts.log` in JSON lines format for later review.

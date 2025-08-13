@@ -73,6 +73,7 @@ class SpreadsheetAgent:
         self.history_dir = Path(".history")
         self.prompts_dir.mkdir(exist_ok=True)
         self.history_dir.mkdir(exist_ok=True)
+        self.api_log_path = Path("api_prompts.log")
 
         self.llama_endpoint = llama_endpoint
         self.model = model
@@ -149,6 +150,14 @@ class SpreadsheetAgent:
             p.write_text("", encoding="utf-8")
         return p.read_text(encoding="utf-8").strip()
 
+    def _log_api_prompt(self, payload: Dict[str, Any]) -> None:
+        try:
+            entry = {"timestamp": datetime.now().isoformat(), "payload": payload}
+            with self.api_log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, cls=NumpyEncoder) + "\n")
+        except Exception as e:
+            print(f"[!] Log error: {e}")
+
     def query_llama(self, user_request: str) -> str:
         """Send info tree + request to llama.cpp and return raw text."""
         system_prompt = self._read_prompt("system.txt")
@@ -168,6 +177,8 @@ class SpreadsheetAgent:
             "temperature": 0.0,
             "max_tokens": 1500,
         }
+
+        self._log_api_prompt(payload)
 
         try:
             r = requests.post(self.llama_endpoint, json=payload, timeout=360)
