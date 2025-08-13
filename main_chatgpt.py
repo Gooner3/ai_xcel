@@ -138,6 +138,8 @@ class SpreadsheetAgent:
                 "USER:\n{user_request}\n\n"
                 "Write pandas code to modify df. No prose. No backticks. No prints."
             ),
+            # Optional user instructions prepended to every request
+            "instructions.txt": "",
         }
         for name, content in defaults.items():
             p = self.prompts_dir / name
@@ -167,6 +169,11 @@ class SpreadsheetAgent:
         info_json = json.dumps(info_tree, indent=2, cls=NumpyEncoder)
 
         prompt = analyze_t.format(info_tree=info_json, user_request=user_request)
+
+        # Prepend any user-specified instructions from .prompts/instructions.txt
+        extra_instructions = self._read_prompt("instructions.txt")
+        if extra_instructions:
+            prompt = f"{extra_instructions}\n\n{prompt}"
 
         payload = {
             "model": self.model,
