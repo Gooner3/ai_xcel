@@ -15,6 +15,10 @@ import pandas as pd
 import requests
 from tabulate import tabulate
 
+# Optional GUI imports
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
+
 
 # =========================
 #   JSON / InfoTree utils
@@ -579,6 +583,125 @@ class SpreadsheetAgent:
 
 
 # =========================
+#   Simple merge GUI
+# =========================
+
+
+class SimpleMergeGUI:
+    """Minimal Tkinter interface for merging and referencing sheets."""
+
+    def __init__(self, main_path: str):
+        self.main_path = Path(main_path)
+        self.main_df = self._load_dataframe(self.main_path)
+        self.other_df: Optional[pd.DataFrame] = None
+
+        self.root = tk.Tk()
+        self.root.title("Sheet Merger")
+
+        self.text = tk.Text(self.root, width=100, height=20)
+        self.text.pack(fill="both", expand=True)
+
+        btn_frame = tk.Frame(self.root)
+        btn_frame.pack(fill="x")
+        tk.Button(btn_frame, text="Load Secondary", command=self.load_secondary).pack(side="left")
+        tk.Button(btn_frame, text="Merge", command=self.merge).pack(side="left")
+        tk.Button(btn_frame, text="Lookup", command=self.lookup).pack(side="left")
+        tk.Button(btn_frame, text="View Secondary", command=self.view_secondary).pack(side="left")
+        tk.Button(btn_frame, text="Save", command=self.save).pack(side="left")
+
+        self.update_preview()
+
+    def _load_dataframe(self, path: Path) -> pd.DataFrame:
+        if path.suffix.lower() == ".csv":
+            return pd.read_csv(path)
+        if path.suffix.lower() in {".xls", ".xlsx"}:
+            return pd.read_excel(path)
+        raise ValueError(f"Unsupported file type: {path}")
+
+    def load_secondary(self):
+        path = filedialog.askopenfilename(
+            title="Select secondary sheet",
+            filetypes=[("Spreadsheets", "*.csv *.xls *.xlsx")],
+        )
+        if not path:
+            return
+        try:
+            self.other_df = self._load_dataframe(Path(path))
+            messagebox.showinfo(
+                "Loaded",
+                f"Loaded secondary sheet ({len(self.other_df)} rows × {len(self.other_df.columns)} cols)",
+            )
+        except Exception as e:
+            messagebox.showerror("Load error", str(e))
+
+    def merge(self):
+        if self.other_df is None:
+            messagebox.showwarning("Merge", "Load a secondary sheet first.")
+            return
+        left = simpledialog.askstring("Merge", "Column in main sheet:")
+        if not left:
+            return
+        right = simpledialog.askstring(
+            "Merge", "Column in secondary sheet (leave blank for same column):"
+        )
+        right = right or left
+        if left not in self.main_df.columns or right not in self.other_df.columns:
+            messagebox.showerror("Merge", "Column not found in one of the sheets.")
+            return
+        self.main_df = self.main_df.merge(
+            self.other_df, left_on=left, right_on=right, how="left"
+        )
+        messagebox.showinfo("Merge", f"Merged on {left} ← {right}.")
+        self.update_preview()
+
+    def lookup(self):
+        if self.other_df is None:
+            messagebox.showwarning("Lookup", "Load a secondary sheet first.")
+            return
+        column = simpledialog.askstring("Lookup", "Column in secondary sheet:")
+        value = simpledialog.askstring("Lookup", "Value to match:")
+        if not column or not value:
+            return
+        if column not in self.other_df.columns:
+            messagebox.showerror("Lookup", "Column not found.")
+            return
+        matches = self.other_df[self.other_df[column].astype(str) == value]
+        if matches.empty:
+            messagebox.showinfo("Lookup", "No matches found.")
+        else:
+            messagebox.showinfo("Lookup", matches.head().to_string())
+
+    def view_secondary(self):
+        if self.other_df is None:
+            messagebox.showwarning("View", "No secondary sheet loaded.")
+            return
+        messagebox.showinfo("Secondary preview", self.other_df.head().to_string())
+
+    def save(self):
+        path = filedialog.asksaveasfilename(
+            initialfile=self.main_path.name,
+            defaultextension=self.main_path.suffix,
+            filetypes=[("CSV", "*.csv"), ("Excel", "*.xlsx"), ("Excel", "*.xls")],
+        )
+        if not path:
+            return
+        try:
+            if Path(path).suffix.lower() == ".csv":
+                self.main_df.to_csv(path, index=False)
+            else:
+                self.main_df.to_excel(path, index=False)
+            messagebox.showinfo("Save", f"Saved to {path}")
+        except Exception as e:
+            messagebox.showerror("Save error", str(e))
+
+    def update_preview(self):
+        self.text.delete("1.0", tk.END)
+        self.text.insert(tk.END, self.main_df.head().to_string())
+
+    def run(self):
+        self.root.mainloop()
+
+# =========================
 #          Main
 # =========================
 
@@ -588,7 +711,14 @@ def main():
     ap.add_argument("--endpoint", "-e", default="http://fedora-1:7860/v1/chat/completions", help="llama.cpp chat completions endpoint")
     ap.add_argument("--model", "-m", default="default", help="Model name loaded in llama.cpp")
     ap.add_argument("--no-autosave", action="store_true", help="Disable autosave after apply/undo")
+    ap.add_argument("--gui", action="store_true", help="Launch simple Tkinter GUI for merging/lookup")
     args = ap.parse_args()
+
+    if args.gui:
+        if not args.sheet:
+            ap.error("sheet required for GUI mode")
+        SimpleMergeGUI(args.sheet).run()
+        return
 
     agent = SpreadsheetAgent(
         sheet_path=args.sheet,
